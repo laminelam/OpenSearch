@@ -70,6 +70,7 @@ import static java.util.Collections.singletonList;
 import static java.util.Collections.singletonMap;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.containsString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
@@ -482,5 +483,48 @@ public class AnalysisRegistryTests extends OpenSearchTestCase {
         });
         assertEquals("Cannot use token filter [exception]", e.getMessage());
 
+    }
+
+    public void testAggregatesAnalyzerBuildFailuresAndContinuesRegistrationLoop() {
+        // Build settings with two broken analyzers (different failure modes)
+        // and one valid analyzer to prove we keep iterating past the first failure.
+        Settings settings = Settings.builder()
+            .put(Environment.PATH_HOME_SETTING.getKey(), createTempDir().toString())
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+
+            // bad1: unknown token filter name -> will fail when producing filter factory
+            .put("index.analysis.analyzer.bad1.type", "custom")
+            .put("index.analysis.analyzer.bad1.tokenizer", "standard")
+            .putList("index.analysis.analyzer.bad1.filter", "lowercase", "does_not_exist_filter")
+
+            // bad2: unknown tokenizer -> will fail when producing tokenizer factory
+            .put("index.analysis.analyzer.bad2.type", "custom")
+            .put("index.analysis.analyzer.bad2.tokenizer", "does_not_exist_tokenizer")
+            .putList("index.analysis.analyzer.bad2.filter", "lowercase")
+
+            // good: valid analyzer we expect to be *attempted* after bad1
+            .put("index.analysis.analyzer.no_split_synonym_analyzer.type", "custom")
+            .put("index.analysis.analyzer.no_split_synonym_analyzer.tokenizer", "standard")
+            .build();
+
+        IndexSettings idxSettings = IndexSettingsModule.newIndexSettings("index", settings);
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> emptyRegistry.build(idxSettings) // uses empty token/filter registries; ok for this test
+        );
+
+        // After the fix, we expect a single aggregated exception that mentions both failing analyzers
+        assertThat(e.getMessage(), containsString("bad1"));
+        assertThat(e.getMessage(), containsString("bad2"));
+
+        // And we expect two suppressed causes (one per bad analyzer)
+        Throwable[] suppressed = e.getSuppressed();
+        assertNotNull(suppressed);
+        assertEquals(2, suppressed.length);
+
+        // Sanity: each suppressed cause should carry a helpful message
+        assertThat(suppressed[0].getMessage(), containsString("bad"));
+        assertThat(suppressed[1].getMessage(), containsString("bad"));
     }
 }

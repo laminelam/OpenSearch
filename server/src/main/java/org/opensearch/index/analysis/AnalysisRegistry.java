@@ -54,6 +54,7 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -637,21 +638,29 @@ public final class AnalysisRegistry implements Closeable {
         Map<String, NamedAnalyzer> analyzers = new HashMap<>();
         Map<String, NamedAnalyzer> normalizers = new HashMap<>();
         Map<String, NamedAnalyzer> whitespaceNormalizers = new HashMap<>();
+        Map<String, Exception> buildErrors = new LinkedHashMap<>();
         for (Map.Entry<String, AnalyzerProvider<?>> entry : analyzerProviders.entrySet()) {
-            analyzers.merge(
-                entry.getKey(),
-                produceAnalyzer(
+            try {
+
+                analyzers.merge(
                     entry.getKey(),
-                    entry.getValue(),
-                    tokenFilterFactoryFactories,
-                    charFilterFactoryFactories,
-                    tokenizerFactoryFactories
-                ),
-                (k, v) -> {
-                    throw new IllegalStateException("already registered analyzer with name: " + entry.getKey());
-                }
-            );
+                    produceAnalyzer(
+                        entry.getKey(),
+                        entry.getValue(),
+                        tokenFilterFactoryFactories,
+                        charFilterFactoryFactories,
+                        tokenizerFactoryFactories
+                    ),
+                    (k, v) -> {
+                        throw new IllegalStateException("already registered analyzer with name: " + entry.getKey());
+                    }
+                );
+            }
+            catch (Exception e) {
+                buildErrors.put(entry.getKey(), e);
+            }
         }
+
         for (Map.Entry<String, AnalyzerProvider<?>> entry : normalizerProviders.entrySet()) {
             processNormalizerFactory(
                 entry.getKey(),
@@ -706,6 +715,14 @@ public final class AnalysisRegistry implements Closeable {
             if (analyzer.getKey().startsWith("_")) {
                 throw new IllegalArgumentException("analyzer name must not start with '_'. got \"" + analyzer.getKey() + "\"");
             }
+        }
+
+        if (!buildErrors.isEmpty()) {
+            IllegalArgumentException aggregated =
+                new IllegalArgumentException("Failed to build analyzers: " + buildErrors.keySet());
+            buildErrors.forEach((name, ex) ->
+                aggregated.addSuppressed(new IllegalArgumentException("[" + name + "] " + ex.getMessage(), ex)));
+            throw aggregated;
         }
         return new IndexAnalyzers(analyzers, normalizers, whitespaceNormalizers);
     }
