@@ -57,11 +57,11 @@ final class TransportSearchHelper {
 
     private static final String INCLUDE_CONTEXT_UUID = "include_context_uuid";
 
+    public static final Version INDICES_IN_SCROLL_ID_VERSION = Version.V_3_4_0;
+
     static InternalScrollSearchRequest internalScrollSearchRequest(ShardSearchContextId id, SearchScrollRequest request) {
         return new InternalScrollSearchRequest(request, id);
     }
-
-    public static final Version INDICES_IN_SCROLL_ID_VERSION = Version.V_3_3_0;
 
     static String buildScrollId(AtomicArray<? extends SearchPhaseResult> searchPhaseResults, Version version) {
         return buildScrollId(searchPhaseResults, null, version);
@@ -88,10 +88,9 @@ final class TransportSearchHelper {
 
             if (version.onOrAfter(INDICES_IN_SCROLL_ID_VERSION)) {
                 // To keep autotagging consistent between the initial SearchRequest
-                // and subsequent SearchScrollRequests, we store exactly the same
-                // index targets that were visible to the indices attribute during
-                // the "search" phase
-                out.writeStringArray(originalIndices == null ? Strings.EMPTY_ARRAY : originalIndices);
+                // and subsequent SearchScrollRequests, we store exactly the original indices
+                // received during the "search" phase
+                out.writeOptionalStringArray(originalIndices);
             }
             byte[] bytes = BytesReference.toBytes(out.bytes());
             return Base64.getUrlEncoder().encodeToString(bytes);
@@ -130,7 +129,7 @@ final class TransportSearchHelper {
                 context[i] = new SearchContextIdForNode(clusterAlias, target, new ShardSearchContextId(contextUUID, id));
             }
 
-            final String[] originalIndices = in.getPosition() < bytes.length ? in.readStringArray() : Strings.EMPTY_ARRAY;
+            final String[] originalIndices = in.getPosition() < bytes.length ? in.readOptionalStringArray() : Strings.EMPTY_ARRAY;
 
             if (in.getPosition() != bytes.length) {
                 throw new IllegalArgumentException("Not all bytes were read");

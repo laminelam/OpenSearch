@@ -95,9 +95,9 @@ public class AutoTaggingActionFilter implements ActionFilter {
         if (isSearchRequest) {
             attributeExtractors.add(new IndicesExtractor((IndicesRequest) request));
         } else {
-            // Scroll: recover the original user-provided expressions from metadata
-            final String[] originalIndices = actionRequestMetadata.originalIndices();
-            if (originalIndices != null && originalIndices.length > 0) {
+            // Scroll: recover the original user-provided indices from ParsedScrollId
+            final String[] originalIndices = ((SearchScrollRequest) request).originalIndicesOrEmpty();
+            if (originalIndices.length > 0) {
                 attributeExtractors.add(new AttributeExtractor<>() {
                     @Override
                     public Attribute getAttribute() {

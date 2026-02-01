@@ -106,7 +106,7 @@ public class AutoTaggingActionFilterTests extends OpenSearchTestCase {
 
         @SuppressWarnings("unchecked")
         ActionRequestMetadata<ActionRequest, ActionResponse> metadata = mock(ActionRequestMetadata.class);
-        when(metadata.originalIndices()).thenReturn(new String[] { "logs-scroll-index" });
+        when(request.originalIndicesOrEmpty()).thenReturn(new String[] { "logs-scroll-index" });
 
         try (ThreadContext.StoredContext ctx = threadPool.getThreadContext().stashContext()) {
             doAnswer(inv -> {

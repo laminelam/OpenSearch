@@ -36,6 +36,7 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.tasks.TaskId;
@@ -108,6 +109,16 @@ public class SearchScrollRequest extends ActionRequest implements ToXContentObje
             parsedScrollId = TransportSearchHelper.parseScrollId(scrollId);
         }
         return parsedScrollId;
+    }
+
+    public String[] originalIndicesOrEmpty() {
+        try {
+            ParsedScrollId parsed = parseScrollId();
+            String[] orig = parsed == null ? null : parsed.getOriginalIndices();
+            return orig == null || orig.length == 0 ? Strings.EMPTY_ARRAY : orig;
+        } catch (IllegalArgumentException e) {
+            return Strings.EMPTY_ARRAY;
+        }
     }
 
     /**
