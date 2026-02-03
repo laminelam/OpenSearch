@@ -467,24 +467,16 @@ public class WlmAutoTaggingIT extends ParameterizedStaticSettingsOpenSearchInteg
 
             try {
                 int afterInitialSearch = getCompletions(workloadGroupId);
-                assertTrue(
-                    "Expected completions to increase after initial search with scroll",
-                    afterInitialSearch > completionsBefore
-                );
+                assertTrue("Expected completions to increase after initial search with scroll", afterInitialSearch > completionsBefore);
 
-                SearchResponse scrollResp = client().prepareSearchScroll(scrollId)
-                    .setScroll(TimeValue.timeValueMinutes(1))
-                    .get();
+                SearchResponse scrollResp = client().prepareSearchScroll(scrollId).setScroll(TimeValue.timeValueMinutes(1)).get();
                 String nextScrollId = scrollResp.getScrollId();
                 if (nextScrollId != null && !nextScrollId.isEmpty()) {
                     scrollId = nextScrollId;
                 }
 
                 int afterScroll = getCompletions(workloadGroupId);
-                assertTrue(
-                    "Expected completions to increase after scroll request as well",
-                    afterScroll > afterInitialSearch
-                );
+                assertTrue("Expected completions to increase after scroll request as well", afterScroll > afterInitialSearch);
             } finally {
                 clearScroll(scrollId);
             }
