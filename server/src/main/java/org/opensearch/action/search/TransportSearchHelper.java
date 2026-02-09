@@ -57,7 +57,7 @@ final class TransportSearchHelper {
 
     private static final String INCLUDE_CONTEXT_UUID = "include_context_uuid";
 
-    public static final Version INDICES_IN_SCROLL_ID_VERSION = Version.V_3_4_0;
+    public static final Version INDICES_IN_SCROLL_ID_VERSION = Version.V_3_6_0;
 
     static InternalScrollSearchRequest internalScrollSearchRequest(ShardSearchContextId id, SearchScrollRequest request) {
         return new InternalScrollSearchRequest(request, id);
