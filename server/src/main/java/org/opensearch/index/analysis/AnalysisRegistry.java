@@ -51,13 +51,17 @@ import org.opensearch.indices.analysis.PreBuiltAnalyzers;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -363,21 +367,14 @@ public final class AnalysisRegistry implements Closeable {
 
     private Map<String, AnalyzerProvider<?>> buildAnalyzerFactories(IndexSettings indexSettings) throws IOException {
         final Map<String, Settings> analyzersSettings = indexSettings.getSettings().getGroups("index.analysis.analyzer");
+        final Map<String, Settings> filterSettings = indexSettings.getSettings().getGroups(INDEX_ANALYSIS_FILTER);
 
-        // Some analyzers depend on others that need to be built first
-        // Sort by 'order', default to 1000
-        List<Map.Entry<String, Settings>> sortedEntries = analyzersSettings.entrySet().stream().sorted((a, b) -> {
-            int orderA = a.getValue().getAsInt("order", 100);
-            int orderB = b.getValue().getAsInt("order", 100);
-            if (orderA != orderB) {
-                return Integer.compare(orderA, orderB);
-            }
-            return a.getKey().compareTo(b.getKey());
-        }).collect(Collectors.toList());
+        Map<String, Set<String>> dependencies = buildAnalyzerDependencies(analyzersSettings, filterSettings);
+        List<String> buildOrder = topologicalSortAnalyzers(dependencies);
 
         Map<String, Settings> sortedAnalyzersSettings = new LinkedHashMap<>();
-        for (Map.Entry<String, Settings> entry : sortedEntries) {
-            sortedAnalyzersSettings.put(entry.getKey(), entry.getValue());
+        for (String analyzerName : buildOrder) {
+            sortedAnalyzersSettings.put(analyzerName, analyzersSettings.get(analyzerName));
         }
 
         return buildMapping(
@@ -387,6 +384,90 @@ public final class AnalysisRegistry implements Closeable {
             analyzers,
             prebuiltAnalysis.analyzerProviderFactories
         );
+    }
+
+    private static Map<String, Set<String>> buildAnalyzerDependencies(
+        Map<String, Settings> analyzersSettings,
+        Map<String, Settings> filterSettings
+    ) {
+        Map<String, Set<String>> dependencies = new LinkedHashMap<>();
+
+        for (Map.Entry<String, Settings> analyzerEntry : analyzersSettings.entrySet()) {
+            String analyzerName = analyzerEntry.getKey();
+            Settings analyzerSettings = analyzerEntry.getValue();
+
+            Set<String> analyzerDependencies = new LinkedHashSet<>();
+            for (String filterName : analyzerSettings.getAsList("filter")) {
+                Settings fs = filterSettings.get(filterName);
+                if (fs == null || fs.isEmpty()) {
+                    continue;
+                }
+
+                String type = fs.get("type");
+                if ("synonym".equals(type) || "synonym_graph".equals(type)) {
+                    String synonymAnalyzer = fs.get("synonym_analyzer");
+                    if (synonymAnalyzer != null
+                        && synonymAnalyzer.equals(analyzerName) == false
+                        && analyzersSettings.containsKey(synonymAnalyzer)) {
+                        analyzerDependencies.add(synonymAnalyzer);
+                    }
+                }
+            }
+
+            dependencies.put(analyzerName, analyzerDependencies);
+        }
+
+        return dependencies;
+    }
+
+    // kahn's algorithm topological sort
+    private static List<String> topologicalSortAnalyzers(Map<String, Set<String>> analyzerDependencies) {
+        Map<String, Integer> remainingDependencies = new LinkedHashMap<>(); // inDegree
+        Map<String, List<String>> dependentsByAnalyzer = new LinkedHashMap<>(); // reverseEdges
+
+        for (String analyzer : analyzerDependencies.keySet()) {
+            remainingDependencies.put(analyzer, 0);
+            dependentsByAnalyzer.put(analyzer, new ArrayList<>());
+        }
+
+        for (Map.Entry<String, Set<String>> entry : analyzerDependencies.entrySet()) {
+            String analyzer = entry.getKey();
+            for (String dependency : entry.getValue()) {
+                if (analyzerDependencies.containsKey(dependency)) {
+                    remainingDependencies.put(analyzer, remainingDependencies.get(analyzer) + 1);
+                    dependentsByAnalyzer.get(dependency).add(analyzer);
+                }
+            }
+        }
+
+        Deque<String> ready = new ArrayDeque<>(); // queue
+        for (Map.Entry<String, Integer> entry : remainingDependencies.entrySet()) {
+            if (entry.getValue() == 0) {
+                ready.addLast(entry.getKey());
+            }
+        }
+
+        List<String> buildOrder = new ArrayList<>();
+        while (ready.isEmpty() == false) {
+            String builtAnalyzer = ready.removeFirst();
+            buildOrder.add(builtAnalyzer);
+
+            for (String dependent : dependentsByAnalyzer.get(builtAnalyzer)) {
+                int remaining = remainingDependencies.get(dependent) - 1;
+                remainingDependencies.put(dependent, remaining);
+                if (remaining == 0) {
+                    ready.addLast(dependent);
+                }
+            }
+        }
+
+        if (buildOrder.size() != analyzerDependencies.size()) {
+            Set<String> cycle = new LinkedHashSet<>(analyzerDependencies.keySet());
+            cycle.removeAll(buildOrder);
+            throw new IllegalArgumentException("Circular analyzer dependency detected via synonym_analyzer: " + cycle);
+        }
+
+        return buildOrder;
     }
 
     private Map<String, AnalyzerProvider<?>> buildNormalizerFactories(IndexSettings indexSettings) throws IOException {
