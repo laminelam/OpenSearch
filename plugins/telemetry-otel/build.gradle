@@ -45,13 +45,8 @@ dependencies {
 
 thirdPartyAudit {
   ignoreViolations(
-   'io.opentelemetry.internal.shaded.jctools.queues.MpscArrayQueueConsumerIndexField',
-   'io.opentelemetry.internal.shaded.jctools.queues.MpscArrayQueueProducerIndexField',
-   'io.opentelemetry.internal.shaded.jctools.queues.MpscArrayQueueProducerLimitField',
-   'io.opentelemetry.internal.shaded.jctools.util.UnsafeAccess',
-   'io.opentelemetry.internal.shaded.jctools.util.UnsafeRefArrayAccess',
-   'io.opentelemetry.exporter.internal.marshal.UnsafeAccess',
-   'io.opentelemetry.exporter.internal.marshal.UnsafeAccess$UnsafeHolder'
+    'io.opentelemetry.exporter.internal.marshal.UnsafeStringEncoder',
+    'io.opentelemetry.exporter.internal.marshal.UnsafeStringEncoder$UnsafeHolder'
   )
 
   ignoreMissingClasses(
@@ -61,20 +56,10 @@ thirdPartyAudit {
     'android.security.NetworkSecurityPolicy',
     'android.util.Log',
     'com.google.common.io.ByteStreams',
-    'com.google.common.util.concurrent.ListenableFuture',
     'com.fasterxml.jackson.databind.ObjectMapper',
-    'io.grpc.CallOptions',
-    'io.grpc.Channel',
     'io.grpc.Drainable',
     'io.grpc.KnownLength',
     'io.grpc.ManagedChannel',
-    'io.grpc.MethodDescriptor',
-    'io.grpc.MethodDescriptor$Builder',
-    'io.grpc.MethodDescriptor$Marshaller',
-    'io.grpc.MethodDescriptor$MethodType',
-    'io.grpc.stub.AbstractFutureStub',
-    'io.grpc.stub.AbstractStub',
-    'io.grpc.stub.ClientCalls',
     'org.bouncycastle.jsse.BCSSLParameters',
     'org.bouncycastle.jsse.BCSSLSocket',
     'org.conscrypt.Conscrypt',
@@ -90,7 +75,8 @@ thirdPartyAudit {
     'io.opentelemetry.sdk.autoconfigure.spi.traces.ConfigurableSpanExporterProvider',
     'io.opentelemetry.sdk.autoconfigure.spi.internal.AutoConfigureListener',
     'io.opentelemetry.sdk.autoconfigure.spi.internal.ComponentProvider',
-    'io.opentelemetry.sdk.autoconfigure.spi.internal.DefaultConfigProperties'
+    'io.opentelemetry.sdk.autoconfigure.spi.internal.DefaultConfigProperties',
+    'io.opentelemetry.sdk.autoconfigure.spi.internal.ExtendedDeclarativeConfigProperties'
   )
 }
 

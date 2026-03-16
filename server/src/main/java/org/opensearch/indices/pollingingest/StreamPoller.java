@@ -9,7 +9,8 @@
 package org.opensearch.indices.pollingingest;
 
 import org.opensearch.cluster.ClusterStateListener;
-import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.cluster.metadata.IngestionSource;
+import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.index.IngestionShardConsumer;
 import org.opensearch.index.IngestionShardPointer;
 
@@ -76,6 +77,13 @@ public interface StreamPoller extends Closeable, ClusterStateListener {
     IngestionShardConsumer getConsumer();
 
     /**
+     * Requests the poller to reinitialize the consumer with updated ingestion source configuration.
+     * This is called when ingestion source params are dynamically updated.
+     * @param updatedIngestionSource the updated ingestion source with new configuration parameters
+     */
+    void requestConsumerReinitialization(IngestionSource updatedIngestionSource);
+
+    /**
      * A state to indicate the current state of the poller
      */
     enum State {
@@ -89,7 +97,7 @@ public interface StreamPoller extends Closeable, ClusterStateListener {
     /**
      *  A reset state to indicate how to reset the pointer
      */
-    @ExperimentalApi
+    @PublicApi(since = "3.6.0")
     enum ResetState {
         EARLIEST,
         LATEST,

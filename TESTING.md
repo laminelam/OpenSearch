@@ -80,13 +80,16 @@ To run OpenSearch in debug mode,
 
 This will instruct all JVMs (including any that run cli tools such as creating the keyring or adding users) to suspend and initiate a debug connection on port incrementing from `5005`. As such, the IDE needs to be instructed to listen for connections on this port. Since we might run multiple JVMs as part of configuring and starting the cluster, it's recommended to configure the IDE to initiate multiple listening attempts. In case of IntelliJ, this option is called "Auto restart" and needs to be checked. In case of Eclipse, "Connection limit" setting needs to be configured with a greater value (ie 10 or more).
 
+Alternately, you can configure your OpenSearch JVM to listen as a debug server on port `5005`, and attach a debugger IDE once opensearch JVM is up and running. Use `./gradlew run --debug-server-jvm` for this debugging setup.
+
 ### Other useful arguments
 
 -   In order to start a node with a different max heap space add: `-Dtests.heap.size=4G`
 -   In order to disable assertions add: `-Dtests.asserts=false`
 -   In order to use a custom data directory: `--data-dir=/tmp/foo`
 -   In order to preserve data in between executions: `--preserve-data`
--   In order to remotely attach a debugger to the process: `--debug-jvm`
+-   In order to start opensearch as a debug server and remotely attach a debugger client (like an IDE debugger): `--debug-server-jvm`
+-   In order to start and attach opensearch process to an existing debug server: `--debug-jvm`
 -   In order to set a different keystore password: `--keystore-password yourpassword`
 -   In order to set an OpenSearch setting, provide a setting with the following prefix: `-Dtests.opensearch.`
 -   In order to enable stack trace of the MockSpanData during testing, add: `-Dtests.telemetry.span.stack_traces=true` (Storing stack traces alongside span data can be useful for comprehensive debugging and performance optimization during testing, as it provides insights into the exact code paths and execution sequences, facilitating efficient issue identification and resolution. Note: Enabling this might lead to OOM issues while running ITs)
@@ -391,6 +394,8 @@ These test tasks can use the `--tests`, `--info`, and `--debug` parameters just 
 Backwards compatibility tests exist to test upgrading from each supported version to the current version.
 
 The test can be run for any versions which the current version will be compatible with. Tests are run for released versions download the distributions from the artifact repository, see [DistributionDownloadPlugin](./buildSrc/src/main/java/org/opensearch/gradle/DistributionDownloadPlugin.java) for the repository location. Tests are run for versions that are not yet released automatically check out the branch and build from source to get the distributions, see [BwcVersions](./buildSrc/src/main/java/org/opensearch/gradle/BwcVersions.java) and [distribution/bwc/build.gradle](./distribution/bwc/build.gradle) for more information.
+
+**Note:** Rolling upgrade tests run in two modes: with remote publication disabled (default) and with remote publication enabled (using a `-remote` suffix cluster). The remote publication tests verify cluster state persistence to remote storage during upgrades. See [Remote Cluster State documentation](https://docs.opensearch.org/latest/tuning-your-cluster/availability-and-recovery/remote-store/remote-cluster-state/) for more information.
 
 The minimum JDK versions for runtime and compiling need to be installed, and environment variables `JAVAx_HOME`, such as `JAVA8_HOME`, pointing to the JDK installations are required to run the tests against unreleased versions, since the distributions are created by building from source. The required JDK versions for each branch are located at [.ci/java-versions.properties](.ci/java-versions.properties), see [BwcSetupExtension](./buildSrc/src/main/java/org/opensearch/gradle/internal/BwcSetupExtension.java) for more information.
 

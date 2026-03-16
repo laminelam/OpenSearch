@@ -329,6 +329,9 @@ class S3Repository extends MeteredBlobStoreRepository {
      */
     static final Setting<String> BASE_PATH_SETTING = Setting.simpleString("base_path");
 
+    /** An override for the s3 region to use for signing requests. */
+    static final Setting<Boolean> LEGACY_MD5_CHECKSUM_CALCULATION = Setting.boolSetting("legacy_md5_checksum_calculation", false);
+
     private final S3Service service;
 
     private volatile String bucket;
@@ -679,5 +682,11 @@ class S3Repository extends MeteredBlobStoreRepository {
             cancellable.cancel();
         }
         super.doClose();
+    }
+
+    @Override
+    public boolean isSeverSideEncryptionEnabled() {
+        // s3 is always server side encrypted.
+        return true;
     }
 }

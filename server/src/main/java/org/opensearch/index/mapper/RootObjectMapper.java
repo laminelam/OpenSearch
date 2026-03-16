@@ -123,6 +123,7 @@ public class RootObjectMapper extends ObjectMapper {
             Explicit<Boolean> enabled,
             Nested nested,
             Dynamic dynamic,
+            Explicit<Boolean> disableObjects,
             Map<String, Mapper> mappers,
             @Nullable Settings settings
         ) {
@@ -131,6 +132,7 @@ public class RootObjectMapper extends ObjectMapper {
                 name,
                 enabled,
                 dynamic,
+                disableObjects,
                 mappers,
                 dynamicDateTimeFormatters,
                 dynamicTemplates,
@@ -182,12 +184,16 @@ public class RootObjectMapper extends ObjectMapper {
             RootObjectMapper.Builder builder = new Builder(name);
             Iterator<Map.Entry<String, Object>> iterator = node.entrySet().iterator();
             Object compositeField = null;
+            Object contextAwareGoupingField = null;
             while (iterator.hasNext()) {
                 Map.Entry<String, Object> entry = iterator.next();
                 String fieldName = entry.getKey();
                 Object fieldNode = entry.getValue();
                 if (fieldName.equals("composite")) {
                     compositeField = fieldNode;
+                    iterator.remove();
+                } else if (fieldName.equals(ContextAwareGroupingFieldMapper.CONTENT_TYPE)) {
+                    contextAwareGoupingField = fieldNode;
                     iterator.remove();
                 } else {
                     if (parseObjectOrDocumentTypeProperties(fieldName, fieldNode, parserContext, builder)
@@ -201,7 +207,26 @@ public class RootObjectMapper extends ObjectMapper {
             if (compositeField != null) {
                 parseCompositeField(builder, (Map<String, Object>) compositeField, parserContext);
             }
+
+            if (contextAwareGoupingField != null) {
+                parseContextAwareGroupingField(builder, (Map<String, Object>) contextAwareGoupingField, parserContext);
+            }
             return builder;
+        }
+
+        protected static void parseContextAwareGroupingField(
+            ObjectMapper.Builder objBuilder,
+            Map<String, Object> contextAwareGroupingNode,
+            ParserContext parserContext
+        ) {
+            Mapper.TypeParser typeParser = parserContext.typeParser(ContextAwareGroupingFieldMapper.CONTENT_TYPE);
+            Mapper.Builder<?> mapperBuilder = typeParser.parse(
+                ContextAwareGroupingFieldMapper.CONTENT_TYPE,
+                contextAwareGroupingNode,
+                parserContext,
+                objBuilder
+            );
+            objBuilder.add(mapperBuilder);
         }
 
         protected boolean processField(RootObjectMapper.Builder builder, String fieldName, Object fieldNode, ParserContext parserContext) {
@@ -272,6 +297,7 @@ public class RootObjectMapper extends ObjectMapper {
         String name,
         Explicit<Boolean> enabled,
         Dynamic dynamic,
+        Explicit<Boolean> disableObjects,
         Map<String, Mapper> mappers,
         Explicit<DateFormatter[]> dynamicDateTimeFormatters,
         Explicit<DynamicTemplate[]> dynamicTemplates,
@@ -279,7 +305,7 @@ public class RootObjectMapper extends ObjectMapper {
         Explicit<Boolean> numericDetection,
         Settings settings
     ) {
-        super(name, name, enabled, Nested.NO, dynamic, mappers, settings);
+        super(name, name, enabled, Nested.NO, dynamic, disableObjects, mappers, settings);
         this.dynamicTemplates = dynamicTemplates;
         this.dynamicDateTimeFormatters = dynamicDateTimeFormatters;
         this.dateDetection = dateDetection;

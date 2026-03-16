@@ -33,7 +33,7 @@ public class MergedSegmentReplicationTarget extends AbstractSegmentReplicationTa
         SegmentReplicationSource source,
         ReplicationListener listener
     ) {
-        super("merged_segment_replication_target", indexShard, checkpoint, source, listener);
+        super("merged_segment_replication_target", indexShard, checkpoint, source, false, listener);
     }
 
     @Override
@@ -55,7 +55,14 @@ public class MergedSegmentReplicationTarget extends AbstractSegmentReplicationTa
         List<StoreFileMetadata> filesToFetch,
         StepListener<GetSegmentFilesResponse> getFilesListener
     ) {
-        source.getMergedSegmentFiles(getId(), checkpoint, filesToFetch, indexShard, this::updateFileRecoveryBytes, getFilesListener);
+        source.getMergedSegmentFiles(
+            getId(),
+            checkpoint,
+            filesToFetch,
+            indexShard,
+            this::updateMergedSegmentFileRecoveryBytes,
+            getFilesListener
+        );
     }
 
     @Override
@@ -68,5 +75,10 @@ public class MergedSegmentReplicationTarget extends AbstractSegmentReplicationTa
     @Override
     public MergedSegmentReplicationTarget retryCopy() {
         return new MergedSegmentReplicationTarget(indexShard, checkpoint, source, listener);
+    }
+
+    protected void updateMergedSegmentFileRecoveryBytes(String fileName, long bytesRecovered) {
+        indexShard.mergedSegmentTransferTracker().addTotalBytesReceived(bytesRecovered);
+        updateFileRecoveryBytes(fileName, bytesRecovered);
     }
 }

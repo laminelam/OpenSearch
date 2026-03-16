@@ -47,7 +47,7 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.fielddata.IndexFieldData;
-import org.opensearch.index.fielddata.plain.SortedSetOrdinalsIndexFieldData;
+import org.opensearch.index.fielddata.plain.NonPruningSortedSetOrdinalsIndexFieldData;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.support.CoreValuesSourceType;
@@ -102,7 +102,7 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
         );
         private final Parameter<String> normalizer = Parameter.stringParam("normalizer", false, m -> toType(m).normalizerName, "default");
         private final Parameter<Map<String, String>> meta = Parameter.metaParam();
-        private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false).alwaysSerialize();
+        private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, true).alwaysSerialize();
         private final IndexAnalyzers indexAnalyzers;
 
         public Builder(String name, IndexAnalyzers indexAnalyzers) {
@@ -328,7 +328,7 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
                 throw new IllegalArgumentException("Field [" + name() + "] of type [" + typeName() + "] doesn't " + "support formats.");
             }
 
-            if (hasDocValues()) {
+            if (hasDocValues() && searchLookup != null) {
                 return new DocValueFetcher(DocValueFormat.RAW, searchLookup.doc().getForField(this));
             }
 
@@ -366,7 +366,7 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
         @Override
         public IndexFieldData.Builder fielddataBuilder(String fullyQualifiedIndexName, Supplier<SearchLookup> searchLookup) {
             failIfNoDocValues();
-            return new SortedSetOrdinalsIndexFieldData.Builder(name(), CoreValuesSourceType.BYTES);
+            return new NonPruningSortedSetOrdinalsIndexFieldData.Builder(name(), CoreValuesSourceType.BYTES);
         }
 
         @Override
@@ -505,10 +505,16 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
         }
 
         private static String getNonWildcardSequence(String value, int startFrom) {
+            int consecutiveBackslashes = 0;
             for (int i = startFrom; i < value.length(); i++) {
                 char c = value.charAt(i);
-                if ((c == '?' || c == '*') && (i == 0 || value.charAt(i - 1) != '\\')) {
-                    return value.substring(startFrom, i);
+                if (c == '\\') {
+                    consecutiveBackslashes++;
+                } else {
+                    if ((c == '?' || c == '*') && consecutiveBackslashes % 2 == 0) {
+                        return value.substring(startFrom, i);
+                    }
+                    consecutiveBackslashes = 0;
                 }
             }
             // Made it to the end. No more wildcards.
@@ -737,7 +743,7 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
         private final Query firstPhaseQuery;
         private final Predicate<String> secondPhaseMatcher;
         private final String patternString; // For toString
-        private final ValueFetcher valueFetcher;
+        private final Supplier<ValueFetcher> valueFetcherSupplier;
         private final SearchLookup searchLookup;
 
         WildcardMatchingQuery(String fieldName, Query firstPhaseQuery, String patternString) {
@@ -758,10 +764,10 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
             this.patternString = Objects.requireNonNull(patternString);
             if (context != null) {
                 this.searchLookup = context.lookup();
-                this.valueFetcher = fieldType.valueFetcher(context, context.lookup(), null);
+                this.valueFetcherSupplier = () -> fieldType.valueFetcher(context, context.lookup(), null);
             } else {
                 this.searchLookup = null;
-                this.valueFetcher = null;
+                this.valueFetcherSupplier = null;
             }
         }
 
@@ -770,14 +776,14 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
             Query firstPhaseQuery,
             Predicate<String> secondPhaseMatcher,
             String patternString,
-            ValueFetcher valueFetcher,
+            Supplier<ValueFetcher> valueFetcherSupplier,
             SearchLookup searchLookup
         ) {
             this.fieldName = fieldName;
             this.firstPhaseQuery = firstPhaseQuery;
             this.secondPhaseMatcher = secondPhaseMatcher;
             this.patternString = patternString;
-            this.valueFetcher = valueFetcher;
+            this.valueFetcherSupplier = valueFetcherSupplier;
             this.searchLookup = searchLookup;
         }
 
@@ -815,7 +821,7 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
                     rewriteFirstPhase,
                     secondPhaseMatcher,
                     patternString,
-                    valueFetcher,
+                    valueFetcherSupplier,
                     searchLookup
                 );
             }
@@ -838,6 +844,9 @@ public class WildcardFieldMapper extends ParametrizedFieldMapper {
                             Scorer approximateScorer = firstPhaseSupplier.get(leadCost);
                             DocIdSetIterator approximation = approximateScorer.iterator();
                             LeafSearchLookup leafSearchLookup = searchLookup.getLeafSearchLookup(context);
+                            // Create a new ValueFetcher per thread.
+                            // ValueFetcher.setNextReader is not thread safe.
+                            final ValueFetcher valueFetcher = valueFetcherSupplier.get();
                             valueFetcher.setNextReader(context);
 
                             TwoPhaseIterator twoPhaseIterator = new TwoPhaseIterator(approximation) {

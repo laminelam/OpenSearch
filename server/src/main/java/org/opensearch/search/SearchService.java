@@ -37,6 +37,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TopDocs;
 import org.opensearch.OpenSearchException;
 import org.opensearch.action.ActionRunnable;
@@ -92,6 +93,7 @@ import org.opensearch.index.query.QueryCoordinatorContext;
 import org.opensearch.index.query.QueryRewriteContext;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.Rewriteable;
+import org.opensearch.index.search.QueryStringQueryParser;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.SearchOperationListener;
@@ -279,7 +281,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
     public static final Setting<Boolean> QUERY_REWRITING_ENABLED_SETTING = Setting.boolSetting(
         "search.query_rewriting.enabled",
-        true,
+        false,
         Property.Dynamic,
         Property.NodeScope
     );
@@ -339,6 +341,39 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Property.Dynamic,
         Property.NodeScope
     );
+
+    // Partition strategy constants
+    public static final String CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY_SEGMENT = "segment";
+    public static final String CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY_BALANCED = "balanced";
+    public static final String CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY_FORCE = "force";
+
+    // Partition strategy setting
+    public static final Setting<String> CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY = Setting.simpleString(
+        "search.concurrent_segment_search.partition_strategy",
+        CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY_BALANCED,
+        value -> {
+            switch (value) {
+                case CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY_SEGMENT:
+                case CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY_BALANCED:
+                case CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY_FORCE:
+                    break;
+                default:
+                    throw new IllegalArgumentException("Setting value must be one of [segment, balanced, force]");
+            }
+        },
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+    // Minimum segment size for balanced partitioning (only applies when partition_strategy = balanced)
+    public static final Setting<Integer> CONCURRENT_SEGMENT_SEARCH_PARTITION_MIN_SEGMENT_SIZE = Setting.intSetting(
+        "search.concurrent_segment_search.partition_min_segment_size",
+        500_000,
+        1000,
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
     // value 0 means rewrite filters optimization in aggregations will be disabled
     @ExperimentalApi
     public static final Setting<Integer> MAX_AGGREGATION_REWRITE_FILTERS = Setting.intSetting(
@@ -368,6 +403,22 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         Setting.Property.Dynamic
     );
 
+    public static final Setting<Integer> SEARCH_MAX_QUERY_STRING_LENGTH = Setting.intSetting(
+        "search.query.max_query_string_length",
+        32_000,
+        1,
+        Integer.MAX_VALUE,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<Boolean> SEARCH_MAX_QUERY_STRING_LENGTH_MONITOR_ONLY = Setting.boolSetting(
+        "search.query.max_query_string_length_monitor_only",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     public static final Setting<Boolean> CLUSTER_ALLOW_DERIVED_FIELD_SETTING = Setting.boolSetting(
         "search.derived_field.enabled",
         true,
@@ -387,6 +438,14 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     public static final Setting<Boolean> KEYWORD_INDEX_OR_DOC_VALUES_ENABLED = Setting.boolSetting(
         "search.keyword_index_or_doc_values_enabled",
         false,
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+    public static final Setting<Long> TERMS_AGGREGATION_MAX_PRECOMPUTE_CARDINALITY = Setting.longSetting(
+        "search.aggregations.terms.max_precompute_cardinality",
+        30_000L,
+        0L,
         Property.Dynamic,
         Property.NodeScope
     );
@@ -522,6 +581,16 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
 
         IndexSearcher.setMaxClauseCount(INDICES_MAX_CLAUSE_COUNT_SETTING.get(settings));
         clusterService.getClusterSettings().addSettingsUpdateConsumer(INDICES_MAX_CLAUSE_COUNT_SETTING, IndexSearcher::setMaxClauseCount);
+
+        QueryStringQueryParser.setMaxQueryStringLength(SEARCH_MAX_QUERY_STRING_LENGTH.get(settings));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(SEARCH_MAX_QUERY_STRING_LENGTH, QueryStringQueryParser::setMaxQueryStringLength);
+        QueryStringQueryParser.setMaxQueryStringLengthMonitorMode(SEARCH_MAX_QUERY_STRING_LENGTH_MONITOR_ONLY.get(settings));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                SEARCH_MAX_QUERY_STRING_LENGTH_MONITOR_ONLY,
+                QueryStringQueryParser::setMaxQueryStringLengthMonitorMode
+            );
 
         allowDerivedField = CLUSTER_ALLOW_DERIVED_FIELD_SETTING.get(settings);
         clusterService.getClusterSettings().addSettingsUpdateConsumer(CLUSTER_ALLOW_DERIVED_FIELD_SETTING, this::setAllowDerivedField);
@@ -1198,8 +1267,8 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
      */
     public PitReaderContext getPitReaderContext(ShardSearchContextId id) {
         ReaderContext context = activeReaders.get(id.getId());
-        if (context instanceof PitReaderContext) {
-            return (PitReaderContext) context;
+        if (context instanceof PitReaderContext pitReaderContext) {
+            return pitReaderContext;
         }
         return null;
     }
@@ -1210,8 +1279,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
     public List<ListPitInfo> getAllPITReaderContexts() {
         final List<ListPitInfo> pitContextsInfo = new ArrayList<>();
         for (ReaderContext ctx : activeReaders.values()) {
-            if (ctx instanceof PitReaderContext) {
-                final PitReaderContext context = (PitReaderContext) ctx;
+            if (ctx instanceof PitReaderContext context) {
                 ListPitInfo pitInfo = new ListPitInfo(context.getPitId(), context.getCreationTime(), context.getKeepAlive());
                 pitContextsInfo.add(pitInfo);
             }
@@ -1505,6 +1573,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
         // nothing to parse...
         if (source == null) {
             context.evaluateRequestShouldUseConcurrentSearch();
+            context.evaluateRequestShouldUseIntraSegmentSearch();
             return;
         }
 
@@ -1681,7 +1750,13 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
                 throw new SearchException(shardTarget, "cannot use `collapse` in a scroll context");
             }
             if (context.searchAfter() != null) {
-                throw new SearchException(shardTarget, "cannot use `collapse` in conjunction with `search_after`");
+                SortField[] sort = context.sort().sort.getSort();
+                if (sort.length != 1 || !sort[0].getField().equals(source.collapse().getField())) {
+                    throw new SearchException(
+                        shardTarget,
+                        "collapse field and sort field must be the same when use `collapse` in conjunction with `search_after`"
+                    );
+                }
             }
             if (context.rescore() != null && context.rescore().isEmpty() == false) {
                 throw new SearchException(shardTarget, "cannot use `collapse` in conjunction with `rescore`");
@@ -1690,6 +1765,7 @@ public class SearchService extends AbstractLifecycleComponent implements IndexEv
             context.collapse(collapseContext);
         }
         context.evaluateRequestShouldUseConcurrentSearch();
+        context.evaluateRequestShouldUseIntraSegmentSearch();
         if (source.profile()) {
             final Function<Query, Collection<Supplier<ProfileMetric>>> pluginProfileMetricsSupplier = (query) -> pluginProfilers.stream()
                 .flatMap(p -> p.getQueryProfileMetrics(context, query).stream())

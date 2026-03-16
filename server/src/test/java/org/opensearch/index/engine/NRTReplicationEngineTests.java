@@ -31,6 +31,7 @@ import org.opensearch.test.IndexSettingsModule;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -52,6 +53,61 @@ public class NRTReplicationEngineTests extends EngineTestCase {
         "index",
         Settings.builder().put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.SEGMENT).build()
     );
+
+    public void testAcquireLastIndexCommit() throws Exception {
+        final AtomicLong globalCheckpoint = new AtomicLong(SequenceNumbers.NO_OPS_PERFORMED);
+
+        try (
+            final Store nrtEngineStore = createStore(INDEX_SETTINGS, newDirectory());
+            final NRTReplicationEngine nrtEngine = buildNrtReplicaEngine(globalCheckpoint, nrtEngineStore, INDEX_SETTINGS)
+        ) {
+            // only index 2 docs here, this will create segments _0 and _1 and after forcemerge into _2.
+            final int docCount = 2;
+            List<Engine.Operation> operations = generateHistoryOnReplica(docCount, randomBoolean(), randomBoolean(), randomBoolean());
+            for (Engine.Operation op : operations) {
+                applyOperation(engine, op);
+                applyOperation(nrtEngine, op);
+                // refresh to create a lot of segments.
+                engine.refresh("test");
+            }
+            assertEquals(2, engine.segmentsStats(false, false).getCount());
+            // wipe the nrt directory initially so we can sync with primary.
+            Lucene.cleanLuceneIndex(nrtEngineStore.directory());
+            for (String file : engine.getLatestSegmentInfos().files(true)) {
+                nrtEngineStore.directory().copyFrom(store.directory(), file, file, IOContext.DEFAULT);
+            }
+            nrtEngine.updateSegments(engine.getLatestSegmentInfos());
+            nrtEngine.flush(false, true);
+
+            // acquire latest commit
+            GatedCloseable<IndexCommit> indexCommitGatedCloseable = nrtEngine.acquireLastIndexCommit(false);
+            List<String> replicaFiles = List.of(nrtEngine.store.directory().listAll());
+
+            // merge primary down to 1 segment
+            engine.forceMerge(true, 1, false, false, false, UUIDs.randomBase64UUID());
+
+            final Collection<String> latestPrimaryFiles = engine.getLatestSegmentInfos().files(false);
+            // copy new segments in and load reader.
+            for (String file : latestPrimaryFiles) {
+                if (replicaFiles.contains(file) == false) {
+                    nrtEngineStore.directory().copyFrom(store.directory(), file, file, IOContext.DEFAULT);
+                }
+            }
+            nrtEngine.updateSegments(engine.getLatestSegmentInfos());
+            nrtEngine.flush(false, true);
+
+            // Verify that the files contained in indexCommitGatedCloseable will not be deleted.
+            replicaFiles = List.of(nrtEngine.store.directory().listAll());
+            assertTrue(replicaFiles.containsAll(indexCommitGatedCloseable.get().getFileNames()));
+
+            // After closing, the files in indexCommitGatedCloseable will be deleted.
+            indexCommitGatedCloseable.close();
+            replicaFiles = List.of(nrtEngine.store.directory().listAll());
+            for (String fileName : indexCommitGatedCloseable.get().getFileNames()) {
+                assertFalse(replicaFiles.contains(fileName));
+            }
+        }
+    }
 
     public void testCreateEngine() throws IOException {
         final AtomicLong globalCheckpoint = new AtomicLong(SequenceNumbers.NO_OPS_PERFORMED);
@@ -352,11 +408,24 @@ public class NRTReplicationEngineTests extends EngineTestCase {
         }
     }
 
-    private NRTReplicationEngine buildNrtReplicaEngine(AtomicLong globalCheckpoint, Store store, IndexSettings settings)
-        throws IOException {
+    private NRTReplicationEngine buildNrtReplicaEngine(
+        AtomicLong globalCheckpoint,
+        Store store,
+        IndexSettings settings,
+        Engine.Warmer warmer
+    ) throws IOException {
         Lucene.cleanLuceneIndex(store.directory());
         final Path translogDir = createTempDir();
-        final EngineConfig replicaConfig = config(settings, store, translogDir, NoMergePolicy.INSTANCE, null, null, globalCheckpoint::get);
+        final EngineConfig replicaConfig = config(
+            settings,
+            store,
+            translogDir,
+            NoMergePolicy.INSTANCE,
+            null,
+            null,
+            globalCheckpoint::get,
+            warmer
+        );
         if (Lucene.indexExists(store.directory()) == false) {
             store.createEmpty(replicaConfig.getIndexSettings().getIndexVersionCreated().luceneVersion);
             final String translogUuid = Translog.createEmptyTranslog(
@@ -370,8 +439,13 @@ public class NRTReplicationEngineTests extends EngineTestCase {
         return new NRTReplicationEngine(replicaConfig);
     }
 
+    private NRTReplicationEngine buildNrtReplicaEngine(AtomicLong globalCheckpoint, Store store, IndexSettings settings)
+        throws IOException {
+        return buildNrtReplicaEngine(globalCheckpoint, store, settings, null);
+    }
+
     private NRTReplicationEngine buildNrtReplicaEngine(AtomicLong globalCheckpoint, Store store) throws IOException {
-        return buildNrtReplicaEngine(globalCheckpoint, store, defaultSettings);
+        return buildNrtReplicaEngine(globalCheckpoint, store, defaultSettings, null);
     }
 
     public void testGetSegmentInfosSnapshotPreservesFilesUntilRelease() throws Exception {
@@ -641,4 +715,74 @@ public class NRTReplicationEngineTests extends EngineTestCase {
             }
         }
     }
+
+    public void testWarmerIsInvokedOnUpdateSegments() throws Exception {
+        final AtomicLong globalCheckpoint = new AtomicLong(SequenceNumbers.NO_OPS_PERFORMED);
+        final List<OpenSearchDirectoryReader> warmedReaders = new ArrayList<>();
+        final Engine.Warmer testWarmer = warmedReaders::add;
+
+        try (
+            final Store nrtEngineStore = createStore(INDEX_SETTINGS, newDirectory());
+            final NRTReplicationEngine nrtEngine = buildNrtReplicaEngine(globalCheckpoint, nrtEngineStore, INDEX_SETTINGS, testWarmer)
+        ) {
+            // Initially no warming should have occurred
+            assertEquals(0, warmedReaders.size());
+
+            // Index docs on primary and refresh to create segments
+            final int opsCount = 2;
+            List<Engine.Operation> operations = generateHistoryOnReplica(opsCount, randomBoolean(), randomBoolean(), randomBoolean());
+            for (Engine.Operation op : operations) {
+                applyOperation(engine, op);
+                applyOperation(nrtEngine, op);
+                engine.refresh("test");
+            }
+
+            // Copy segments from primary to replica and update
+            Lucene.cleanLuceneIndex(nrtEngineStore.directory());
+            Collection<String> latestPrimaryFiles = engine.getLatestSegmentInfos().files(false);
+            copySegments(latestPrimaryFiles, nrtEngine);
+            nrtEngine.updateSegments(engine.getLatestSegmentInfos());
+
+            // Verify warmer was invoked after updateSegments
+            assertEquals(1, warmedReaders.size());
+            assertNotNull(warmedReaders.getFirst());
+
+            // Merge primary down to 1 segment and replicate again
+            engine.forceMerge(true, 1, false, false, false, UUIDs.randomBase64UUID());
+            latestPrimaryFiles = engine.getLatestSegmentInfos().files(false);
+            copySegments(latestPrimaryFiles, nrtEngine);
+            nrtEngine.updateSegments(engine.getLatestSegmentInfos());
+
+            // Verify warmer was invoked again with the merged segments
+            assertEquals(2, warmedReaders.size());
+        }
+    }
+
+    public void testWarmerExceptionDoesNotPreventUpdateSegments() throws Exception {
+        final AtomicLong globalCheckpoint = new AtomicLong(SequenceNumbers.NO_OPS_PERFORMED);
+        final Engine.Warmer failingWarmer = reader -> { throw new RuntimeException("warmer failure"); };
+
+        try (
+            final Store nrtEngineStore = createStore(INDEX_SETTINGS, newDirectory());
+            final NRTReplicationEngine nrtEngine = buildNrtReplicaEngine(globalCheckpoint, nrtEngineStore, INDEX_SETTINGS, failingWarmer)
+        ) {
+            // Index docs on primary and refresh
+            List<Engine.Operation> operations = generateHistoryOnReplica(2, randomBoolean(), randomBoolean(), randomBoolean());
+            for (Engine.Operation op : operations) {
+                applyOperation(engine, op);
+                applyOperation(nrtEngine, op);
+                engine.refresh("test");
+            }
+
+            // Copy segments and update - should succeed even though warmer throws
+            Lucene.cleanLuceneIndex(nrtEngineStore.directory());
+            Collection<String> latestPrimaryFiles = engine.getLatestSegmentInfos().files(false);
+            copySegments(latestPrimaryFiles, nrtEngine);
+            nrtEngine.updateSegments(engine.getLatestSegmentInfos());
+
+            // Verify the engine is still functional after warmer failure
+            assertEquals(engine.getLatestSegmentInfos().getVersion(), nrtEngine.getLatestSegmentInfos().getVersion());
+        }
+    }
+
 }

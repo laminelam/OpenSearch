@@ -33,6 +33,7 @@
 package org.opensearch.tools.cli.plugin;
 
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
@@ -74,6 +75,7 @@ import org.opensearch.plugins.Platforms;
 import org.opensearch.plugins.PluginInfo;
 import org.opensearch.plugins.PluginTestUtil;
 import org.opensearch.semver.SemverRange;
+import org.opensearch.test.BouncyCastleThreadFilter;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.PosixPermissionsResetter;
 import org.opensearch.test.VersionUtils;
@@ -138,6 +140,7 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
 
 @LuceneTestCase.SuppressFileSystems("*")
+@ThreadLeakFilters(filters = BouncyCastleThreadFilter.class)
 public class InstallPluginCommandTests extends OpenSearchTestCase {
 
     static {
@@ -433,8 +436,6 @@ public class InstallPluginCommandTests extends OpenSearchTestCase {
 
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(configDir)) {
                 for (Path file : stream) {
-                    assertFalse("not a dir", Files.isDirectory(file));
-
                     if (isPosix) {
                         PosixFileAttributes attributes = Files.readAttributes(file, PosixFileAttributes.class);
                         if (user != null) {
@@ -803,9 +804,14 @@ public class InstallPluginCommandTests extends OpenSearchTestCase {
         Files.createDirectories(dirInConfigDir);
         Files.createFile(dirInConfigDir.resolve("myconfig.yml"));
         String pluginZip = createPluginUrl("fake", pluginDir);
-        UserException e = expectThrows(UserException.class, () -> installPlugin(pluginZip, env.v1()));
-        assertTrue(e.getMessage(), e.getMessage().contains("Directories not allowed in config dir for plugin"));
-        assertInstallCleaned(env.v2());
+        installPlugin(pluginZip, env.v1());
+        assertPlugin("fake", pluginDir, env.v2());
+
+        // Verify the directory and file were installed
+        Path installedConfigDir = env.v2().configDir().resolve("fake").resolve("foo");
+        assertTrue(Files.exists(installedConfigDir));
+        assertTrue(Files.isDirectory(installedConfigDir));
+        assertTrue(Files.exists(installedConfigDir.resolve("myconfig.yml")));
     }
 
     public void testMissingDescriptor() throws Exception {

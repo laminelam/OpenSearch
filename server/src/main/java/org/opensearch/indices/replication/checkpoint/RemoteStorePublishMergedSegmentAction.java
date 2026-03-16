@@ -14,6 +14,8 @@ import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.replication.ReplicationResponse;
 import org.opensearch.cluster.action.shard.ShardStateAction;
+import org.opensearch.cluster.metadata.CryptoMetadata;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.Settings;
@@ -83,8 +85,10 @@ public class RemoteStorePublishMergedSegmentAction extends AbstractPublishCheckp
     protected void doReplicaOperation(RemoteStorePublishMergedSegmentRequest shardRequest, IndexShard replica) {
         RemoteStoreMergedSegmentCheckpoint checkpoint = shardRequest.getMergedSegment();
         if (checkpoint.getShardId().equals(replica.shardId())) {
+            long startTime = System.currentTimeMillis();
             replica.getRemoteDirectory().markMergedSegmentsPendingDownload(checkpoint.getLocalToRemoteSegmentFilenameMap());
             replicationService.onNewMergedSegmentCheckpoint(checkpoint, replica);
+            replica.mergedSegmentTransferTracker().addTotalReceiveTimeMillis(System.currentTimeMillis() - startTime);
         } else {
             logger.warn(
                 () -> new ParameterizedMessage(
@@ -114,6 +118,7 @@ public class RemoteStorePublishMergedSegmentAction extends AbstractPublishCheckp
         long elapsedTimeMillis = endTimeMillis - startTimeMillis;
         long timeoutMillis = indexShard.getRecoverySettings().getMergedSegmentReplicationTimeout().millis();
         long timeLeftMillis = Math.max(0, timeoutMillis - elapsedTimeMillis);
+        indexShard.mergedSegmentTransferTracker().addTotalSendTimeMillis(elapsedTimeMillis);
 
         if (timeLeftMillis > 0) {
             RemoteStoreMergedSegmentCheckpoint remoteStoreMergedSegmentCheckpoint = new RemoteStoreMergedSegmentCheckpoint(
@@ -126,9 +131,19 @@ public class RemoteStorePublishMergedSegmentAction extends AbstractPublishCheckp
                 new RemoteStorePublishMergedSegmentRequest(remoteStoreMergedSegmentCheckpoint),
                 "segrep_remote_publish_merged_segment",
                 true,
-                TimeValue.timeValueMillis(timeLeftMillis)
+                TimeValue.timeValueMillis(timeLeftMillis),
+                new ActionListener<>() {
+                    @Override
+                    public void onResponse(Void unused) {}
+
+                    @Override
+                    public void onFailure(Exception e) {
+                        indexShard.mergedSegmentTransferTracker().incrementTotalWarmFailureCount();
+                    }
+                }
             );
         } else {
+            indexShard.mergedSegmentTransferTracker().incrementTotalWarmFailureCount();
             logger.warn(
                 () -> new ParameterizedMessage(
                     "Unable to confirm upload of merged segment {} to remote store. Timeout of {}ms exceeded. Skipping pre-copy.",
@@ -148,6 +163,16 @@ public class RemoteStorePublishMergedSegmentAction extends AbstractPublishCheckp
             .stream()
             .collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().length()));
         final CountDownLatch latch = new CountDownLatch(1);
+
+        // Extract crypto metadata for merged segment upload
+        CryptoMetadata cryptoMetadata = null;
+        if (indexShard.indexSettings() != null) {
+            IndexMetadata indexMetadata = indexShard.indexSettings().getIndexMetadata();
+            if (indexMetadata != null) {
+                cryptoMetadata = CryptoMetadata.fromIndexSettings(indexMetadata.getSettings());
+            }
+        }
+
         getRemoteStoreUploaderService(indexShard).uploadSegments(segmentsToUpload, segmentsSizeMap, new ActionListener<>() {
             @Override
             public void onResponse(Void unused) {
@@ -167,13 +192,14 @@ public class RemoteStorePublishMergedSegmentAction extends AbstractPublishCheckp
             @Override
             public void onSuccess(String file) {
                 localToRemoteStoreFilenames.put(file, indexShard.getRemoteDirectory().getExistingRemoteFilename(file));
+                indexShard.mergedSegmentTransferTracker().addTotalBytesSent(checkpoint.getMetadataMap().get(file).length());
             }
 
             @Override
             public void onFailure(String file) {
                 logger.warn("Unable to upload segments during merge. Continuing.");
             }
-        }, true);
+        }, true, cryptoMetadata);
         try {
             long timeout = indexShard.getRecoverySettings().getMergedSegmentReplicationTimeout().seconds();
             if (latch.await(timeout, TimeUnit.SECONDS) == false) {

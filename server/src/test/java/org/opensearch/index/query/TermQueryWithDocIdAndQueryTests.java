@@ -8,6 +8,7 @@
 
 package org.opensearch.index.query;
 
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.action.get.GetRequest;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
+import static org.opensearch.Version.MASK;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
@@ -46,7 +48,7 @@ public class TermQueryWithDocIdAndQueryTests extends OpenSearchTestCase {
 
     private IndexSettings newTestIndexSettings(int maxTermsCount, int maxResultWindow) {
         Settings settings = Settings.builder()
-            .put(IndexMetadata.SETTING_VERSION_CREATED, 2000099)
+            .put(IndexMetadata.SETTING_VERSION_CREATED, 2000099 ^ MASK)
             .put("index.max_terms_count", maxTermsCount)
             .put("index.max_result_window", maxResultWindow)
             .build();
@@ -249,22 +251,6 @@ public class TermQueryWithDocIdAndQueryTests extends OpenSearchTestCase {
         verify(mockClient, atLeastOnce()).get(any(GetRequest.class), any());
     }
 
-    private QueryBuilder mockQueryBuilder() {
-        return mock(QueryBuilder.class);
-    }
-
-    private QueryRewriteContext mockRewriteContextForFetch(Client client) {
-        QueryRewriteContext rewriteContext = mock(QueryRewriteContext.class);
-        doAnswer(invocation -> {
-            Object asyncAction = invocation.getArgument(0);
-            @SuppressWarnings("unchecked")
-            BiConsumer<Client, ActionListener<List<Object>>> lambda = (BiConsumer<Client, ActionListener<List<Object>>>) asyncAction;
-            lambda.accept(client, ActionListener.wrap(resp -> {}, ex -> fail("Should not throw")));
-            return null;
-        }).when(rewriteContext).registerAsyncAction(any());
-        return rewriteContext;
-    }
-
     public void testFetchIsCoveredWithTermsLookupQuery() throws Exception {
         QueryBuilder subQuery = mock(QueryBuilder.class);
         TermsLookup termsLookup = new TermsLookup("classes", null, "enrolled", subQuery);
@@ -387,12 +373,10 @@ public class TermQueryWithDocIdAndQueryTests extends OpenSearchTestCase {
         when(mockClient.admin()).thenReturn(mockAdminClient);
         when(mockAdminClient.indices()).thenReturn(mockIndicesAdminClient);
 
-        // Settings that produce a small fetch size
-        int maxTermsCount = 5, maxResultWindow = 5, maxClauseCount = 5;
+        // Set maxTermsCount and maxResultWindow high so maxClauseCount (3) is the limiting factor
         Settings idxSettings = Settings.builder()
-            .put("index.max_terms_count", maxTermsCount)
-            .put("index.max_result_window", maxResultWindow)
-            .put("indices.query.max_clause_count", maxClauseCount)
+            .put(IndexSettings.MAX_TERMS_COUNT_SETTING.getKey(), 100)
+            .put(IndexSettings.MAX_RESULT_WINDOW_SETTING.getKey(), 100)
             .build();
 
         // Simulate settings response
@@ -406,11 +390,11 @@ public class TermQueryWithDocIdAndQueryTests extends OpenSearchTestCase {
             return null;
         }).when(mockIndicesAdminClient).getSettings(any(), any());
 
-        // Simulate a search response with more total hits than fetchSize
+        // Simulate a search response with more total hits than maxClauseCount (3)
         doAnswer(invocation -> {
             ActionListener<org.opensearch.action.search.SearchResponse> listener = invocation.getArgument(1);
 
-            SearchHit[] hits = new SearchHit[5]; // Only 5 returned
+            SearchHit[] hits = new SearchHit[5];
             for (int i = 0; i < 5; i++)
                 hits[i] = new SearchHit(i);
             org.apache.lucene.search.TotalHits totalHits = new org.apache.lucene.search.TotalHits(
@@ -458,8 +442,15 @@ public class TermQueryWithDocIdAndQueryTests extends OpenSearchTestCase {
             return null;
         }).when(mockRewriteContext).registerAsyncAction(any());
 
-        IllegalArgumentException ex = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(mockRewriteContext));
-        assertTrue(ex.getMessage().contains("exceed fetch limit"));
+        // Set maxClauseCount to 3 so it becomes the actual limiting factor via IndexSearcher
+        int originalMaxClauseCount = IndexSearcher.getMaxClauseCount();
+        try {
+            IndexSearcher.setMaxClauseCount(3);
+            IllegalArgumentException ex = expectThrows(IllegalArgumentException.class, () -> builder.doRewrite(mockRewriteContext));
+            assertTrue(ex.getMessage().contains("exceed fetch limit"));
+        } finally {
+            IndexSearcher.setMaxClauseCount(originalMaxClauseCount);
+        }
     }
 
     public void testMaxTermsCountSettingGetterConsistency() {

@@ -43,6 +43,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lease.Releasables;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.index.cache.bitset.BitsetFilterCache;
@@ -64,6 +65,7 @@ import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.SearchContextAggregations;
 import org.opensearch.search.aggregations.bucket.LocalBucketCountThresholds;
 import org.opensearch.search.aggregations.bucket.terms.TermsAggregator;
+import org.opensearch.search.aggregations.metrics.CardinalityAggregationContext;
 import org.opensearch.search.collapse.CollapseContext;
 import org.opensearch.search.dfs.DfsSearchResult;
 import org.opensearch.search.fetch.FetchPhase;
@@ -80,6 +82,7 @@ import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.search.query.ReduceableSearchResult;
 import org.opensearch.search.rescore.RescoreContext;
 import org.opensearch.search.sort.SortAndFormats;
+import org.opensearch.search.streaming.FlushMode;
 import org.opensearch.search.suggest.SuggestionSearchContext;
 
 import java.util.Collection;
@@ -89,6 +92,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_PARTITION_MIN_SEGMENT_SIZE;
+import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY;
 
 /**
  * This class encapsulates the state needed to execute a search. It holds a reference to the
@@ -520,6 +526,21 @@ public abstract class SearchContext implements Releasable {
 
     public abstract int getTargetMaxSliceCount();
 
+    @ExperimentalApi
+    public long getStreamingMaxEstimatedBucketCount() {
+        return 100_000L;
+    }
+
+    @ExperimentalApi
+    public double getStreamingMinCardinalityRatio() {
+        return 0.01;
+    }
+
+    @ExperimentalApi
+    public long getStreamingMinEstimatedBucketCount() {
+        return 1000L;
+    }
+
     public abstract boolean shouldUseTimeSeriesDescSortOptimization();
 
     public boolean getStarTreeIndexEnabled() {
@@ -537,6 +558,15 @@ public abstract class SearchContext implements Releasable {
 
     public int cardinalityAggregationPruningThreshold() {
         return 0;
+    }
+
+    @ExperimentalApi
+    public long termsAggregationMaxPrecomputeCardinality() {
+        return 30_000L;
+    }
+
+    public CardinalityAggregationContext cardinalityAggregationContext() {
+        return new CardinalityAggregationContext(false, Runtime.getRuntime().maxMemory() / 100);
     }
 
     public int bucketSelectionStrategyFactor() {
@@ -559,6 +589,37 @@ public abstract class SearchContext implements Releasable {
 
     @ExperimentalApi
     public boolean isStreamSearch() {
+        return false;
+    }
+
+    /**
+     * Gets the resolved flush mode for this search context.
+     */
+    @ExperimentalApi
+    public FlushMode getFlushMode() {
+        return null;
+    }
+
+    /**
+     * Atomically sets the flush mode if not already set. Returns true if successful.
+     */
+    @ExperimentalApi
+    public boolean setFlushModeIfAbsent(FlushMode flushMode) {
+        return false;
+    }
+
+    public String getPartitionStrategy() {
+        return CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY.getDefault(Settings.EMPTY);
+    }
+
+    public int getPartitionMinSegmentSize() {
+        return CONCURRENT_SEGMENT_SEARCH_PARTITION_MIN_SEGMENT_SIZE.getDefault(Settings.EMPTY);
+    }
+
+    /**
+     * Evaluates whether this request should use intra-segment search based on query and aggregation analysis.
+     */
+    public boolean shouldUseIntraSegmentSearch() {
         return false;
     }
 }

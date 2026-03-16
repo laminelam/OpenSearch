@@ -47,6 +47,7 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.ChannelActionListener;
+import org.opensearch.action.support.TransportIndicesResolvingAction;
 import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.support.replication.ReplicationMode;
 import org.opensearch.action.support.replication.ReplicationOperation;
@@ -62,6 +63,7 @@ import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.AllocationId;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -73,6 +75,7 @@ import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
+import org.opensearch.common.util.concurrent.OpenSearchThreadPoolExecutor;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesReference;
@@ -113,7 +116,7 @@ import java.io.IOException;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -123,7 +126,9 @@ import java.util.function.LongSupplier;
  *
  * @opensearch.internal
  */
-public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequest, BulkShardRequest, BulkShardResponse> {
+public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequest, BulkShardRequest, BulkShardResponse>
+    implements
+        TransportIndicesResolvingAction<BulkShardRequest> {
 
     public static final String ACTION_NAME = BulkAction.NAME + "[s]";
 
@@ -216,6 +221,11 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
         } catch (RuntimeException e) {
             listener.onFailure(e);
         }
+    }
+
+    @Override
+    public ResolvedIndices resolveIndices(BulkShardRequest request) {
+        return ResolvedIndices.of(request.index());
     }
 
     /**
@@ -462,12 +472,13 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
     ) {
         new ActionRunnable<PrimaryResult<BulkShardRequest, BulkShardResponse>>(listener) {
 
-            private final Executor executor = threadPool.executor(executorName);
+            private final ExecutorService executor = threadPool.executor(executorName);
 
             private final BulkPrimaryExecutionContext context = new BulkPrimaryExecutionContext(request, primary);
 
             @Override
             protected void doRun() throws Exception {
+                long startTime = System.nanoTime();
                 while (context.hasMoreOperationsToExecute()) {
                     if (executeBulkItemRequest(
                         context,
@@ -484,7 +495,12 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
                     assert context.isInitial(); // either completed and moved to next or reset
                 }
                 // We're done, there's no more operations to execute so we resolve the wrapped listener
-                finishRequest();
+                long serviceTimeNanos = System.nanoTime() - startTime;
+                if (executor instanceof OpenSearchThreadPoolExecutor) {
+                    finishRequest(serviceTimeNanos, ((OpenSearchThreadPoolExecutor) executor).getQueue().size());
+                } else {
+                    finishRequest(serviceTimeNanos, 0);
+                }
             }
 
             @Override
@@ -510,7 +526,7 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
                                 null
                             );
                         }
-                        finishRequest();
+                        finishRequest(-1, -1);
                     }
 
                     @Override
@@ -520,7 +536,7 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
                 });
             }
 
-            private void finishRequest() {
+            private void finishRequest(long serviceTimeEWMAInNanos, int nodeQueueSize) {
                 // If no actual writes occurred (locationToSync is null), we should not trigger refresh
                 // even if the request has RefreshPolicy.IMMEDIATE
                 final Translog.Location locationToSync = context.getLocationToSync();
@@ -545,7 +561,7 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
                     listener,
                     () -> new WritePrimaryResult<>(
                         requestForResult,
-                        context.buildShardResponse(),
+                        context.buildShardResponse(serviceTimeEWMAInNanos, nodeQueueSize),
                         locationToSync,
                         null,
                         context.getPrimary(),

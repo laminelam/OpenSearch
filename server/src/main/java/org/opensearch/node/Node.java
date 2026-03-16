@@ -57,7 +57,6 @@ import org.opensearch.action.search.SearchTransportService;
 import org.opensearch.action.search.StreamSearchTransportService;
 import org.opensearch.action.support.TransportAction;
 import org.opensearch.action.update.UpdateHelper;
-import org.opensearch.arrow.spi.StreamManager;
 import org.opensearch.bootstrap.BootstrapCheck;
 import org.opensearch.bootstrap.BootstrapContext;
 import org.opensearch.cluster.ClusterInfoService;
@@ -161,6 +160,7 @@ import org.opensearch.index.IngestionConsumerFactory;
 import org.opensearch.index.SegmentReplicationStatsTracker;
 import org.opensearch.index.analysis.AnalysisRegistry;
 import org.opensearch.index.autoforcemerge.AutoForceMergeManager;
+import org.opensearch.index.autoforcemerge.AutoForceMergeMetrics;
 import org.opensearch.index.compositeindex.CompositeIndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.MergedSegmentWarmerFactory;
@@ -199,10 +199,13 @@ import org.opensearch.indices.store.IndicesStore;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.ingest.SystemIngestPipelineCache;
 import org.opensearch.monitor.MonitorService;
+import org.opensearch.monitor.NodeRuntimeMetrics;
 import org.opensearch.monitor.fs.FsHealthService;
 import org.opensearch.monitor.fs.FsProbe;
 import org.opensearch.monitor.fs.FsServiceProvider;
 import org.opensearch.monitor.jvm.JvmInfo;
+import org.opensearch.monitor.os.OsProbe;
+import org.opensearch.monitor.process.ProcessProbe;
 import org.opensearch.node.remotestore.RemoteStoreNodeService;
 import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 import org.opensearch.node.resource.tracker.NodeResourceUsageTracker;
@@ -237,7 +240,6 @@ import org.opensearch.plugins.ScriptPlugin;
 import org.opensearch.plugins.SearchPipelinePlugin;
 import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.plugins.SecureSettingsFactory;
-import org.opensearch.plugins.StreamManagerPlugin;
 import org.opensearch.plugins.SystemIndexPlugin;
 import org.opensearch.plugins.TaskManagerClientPlugin;
 import org.opensearch.plugins.TelemetryAwarePlugin;
@@ -341,7 +343,6 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static java.util.stream.Collectors.toList;
-import static org.opensearch.common.util.FeatureFlags.ARROW_STREAMS_SETTING;
 import static org.opensearch.common.util.FeatureFlags.BACKGROUND_TASK_EXECUTION_EXPERIMENTAL;
 import static org.opensearch.common.util.FeatureFlags.STREAM_TRANSPORT;
 import static org.opensearch.common.util.FeatureFlags.TELEMETRY;
@@ -628,8 +629,9 @@ public class Node implements Closeable {
             }
 
             final SetOnce<RepositoriesService> repositoriesServiceReference = new SetOnce<>();
+            final SetOnce<IngestService> ingestServiceReference = new SetOnce<>();
             final RemoteStoreNodeService remoteStoreNodeService = new RemoteStoreNodeService(repositoriesServiceReference::get, threadPool);
-            localNodeFactory = new LocalNodeFactory(settings, nodeEnvironment.nodeId(), remoteStoreNodeService);
+            localNodeFactory = new RemoteStoreVerifyingLocalNodeFactory(settings, nodeEnvironment.nodeId(), remoteStoreNodeService);
             resourcesToClose.add(() -> ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS));
             final ResourceWatcherService resourceWatcherService = new ResourceWatcherService(settings, threadPool);
             resourcesToClose.add(resourceWatcherService);
@@ -1003,6 +1005,7 @@ public class Node implements Closeable {
                 searchRequestStats,
                 remoteStoreStatsTrackerFactory,
                 ingestionConsumerFactories,
+                ingestServiceReference::get,
                 recoverySettings,
                 cacheService,
                 remoteStoreSettings,
@@ -1024,6 +1027,7 @@ public class Node implements Closeable {
                 xContentRegistry,
                 new SystemIngestPipelineCache()
             );
+            ingestServiceReference.set(ingestService);
 
             final FsServiceProvider fsServiceProvider = new FsServiceProvider(
                 settings,
@@ -1033,6 +1037,14 @@ public class Node implements Closeable {
                 indicesService
             );
             final MonitorService monitorService = new MonitorService(settings, threadPool, fsServiceProvider);
+
+            final NodeRuntimeMetrics nodeRuntimeMetrics = new NodeRuntimeMetrics(
+                metricsRegistry,
+                monitorService.jvmService(),
+                ProcessProbe.getInstance(),
+                OsProbe.getInstance()
+            );
+            resourcesToClose.add(nodeRuntimeMetrics);
 
             final AliasValidator aliasValidator = new AliasValidator();
 
@@ -1208,7 +1220,14 @@ public class Node implements Closeable {
                 workloadGroupService
             );
 
-            this.autoForceMergeManager = new AutoForceMergeManager(threadPool, monitorService, indicesService, clusterService);
+            final AutoForceMergeMetrics autoForceMergeMetrics = new AutoForceMergeMetrics(metricsRegistry);
+            this.autoForceMergeManager = new AutoForceMergeManager(
+                threadPool,
+                monitorService,
+                indicesService,
+                clusterService,
+                autoForceMergeMetrics
+            );
 
             final Collection<SecureSettingsFactory> secureSettingsFactories = pluginsService.filterPlugins(Plugin.class)
                 .stream()
@@ -1263,7 +1282,7 @@ public class Node implements Closeable {
 
             Set<String> taskHeaders = Stream.concat(
                 pluginsService.filterPlugins(ActionPlugin.class).stream().flatMap(p -> p.getTaskHeaders().stream()),
-                Stream.of(Task.X_OPAQUE_ID)
+                Task.REQUEST_HEADERS.stream()
             ).collect(Collectors.toSet());
 
             final TransportService transportService = newTransportService(
@@ -1284,7 +1303,7 @@ public class Node implements Closeable {
                         streamTransport,
                         threadPool,
                         networkModule.getTransportInterceptor(),
-                        new LocalNodeFactory(settings, nodeEnvironment.nodeId(), remoteStoreNodeService),
+                        new LocalNodeFactory(settings, nodeEnvironment.nodeId()),
                         settingsModule.getClusterSettings(),
                         transportService.getTaskManager(),
                         transportService.getRemoteClusterService(),
@@ -1485,25 +1504,6 @@ public class Node implements Closeable {
                 cacheService
             );
 
-            if (FeatureFlags.isEnabled(ARROW_STREAMS_SETTING)) {
-                final List<StreamManagerPlugin> streamManagerPlugins = pluginsService.filterPlugins(StreamManagerPlugin.class);
-
-                final List<StreamManager> streamManagers = streamManagerPlugins.stream()
-                    .map(StreamManagerPlugin::getStreamManager)
-                    .filter(Optional::isPresent)
-                    .map(Optional::get)
-                    .toList();
-
-                if (streamManagers.size() > 1) {
-                    throw new IllegalStateException(
-                        String.format(Locale.ROOT, "Only one StreamManagerPlugin can be installed. Found: %d", streamManagerPlugins.size())
-                    );
-                } else if (streamManagers.isEmpty() == false) {
-                    StreamManager streamManager = streamManagers.getFirst();
-                    streamManagerPlugins.forEach(plugin -> plugin.onStreamManagerInitialized(streamManager));
-                }
-            }
-
             final SearchService searchService = newSearchService(
                 clusterService,
                 indicesService,
@@ -1587,6 +1587,11 @@ public class Node implements Closeable {
                 b.bind(PersistedClusterStateService.class).toInstance(lucenePersistedStateFactory);
                 b.bind(IndicesService.class).toInstance(indicesService);
                 b.bind(RemoteStoreStatsTrackerFactory.class).toInstance(remoteStoreStatsTrackerFactory);
+                if (fileCache != null) {
+                    b.bind(FileCache.class).toInstance(fileCache);
+                } else {
+                    b.bind(FileCache.class).toProvider(Providers.of(null));
+                }
                 b.bind(AliasValidator.class).toInstance(aliasValidator);
                 b.bind(MetadataCreateIndexService.class).toInstance(metadataCreateIndexService);
                 b.bind(AwarenessReplicaBalance.class).toInstance(awarenessReplicaBalance);
@@ -1669,16 +1674,10 @@ public class Node implements Closeable {
                 b.bind(MergedSegmentWarmerFactory.class).toInstance(mergedSegmentWarmerFactory);
                 b.bind(MappingTransformerRegistry.class).toInstance(mappingTransformerRegistry);
                 b.bind(AutoForceMergeManager.class).toInstance(autoForceMergeManager);
-                if (FeatureFlags.isEnabled(FeatureFlags.MERGED_SEGMENT_WARMER_EXPERIMENTAL_FLAG)) {
-                    if (isRemoteDataAttributePresent(settings)) {
-                        b.bind(MergedSegmentPublisher.PublishAction.class)
-                            .to(RemoteStorePublishMergedSegmentAction.class)
-                            .asEagerSingleton();
-                    } else {
-                        b.bind(MergedSegmentPublisher.PublishAction.class).to(PublishMergedSegmentAction.class).asEagerSingleton();
-                    }
+                if (isRemoteDataAttributePresent(settings)) {
+                    b.bind(MergedSegmentPublisher.PublishAction.class).to(RemoteStorePublishMergedSegmentAction.class).asEagerSingleton();
                 } else {
-                    b.bind(MergedSegmentPublisher.PublishAction.class).toInstance((shard, checkpoint) -> {});
+                    b.bind(MergedSegmentPublisher.PublishAction.class).to(PublishMergedSegmentAction.class).asEagerSingleton();
                 }
                 b.bind(MergedSegmentPublisher.class).asEagerSingleton();
 
@@ -2313,16 +2312,17 @@ public class Node implements Closeable {
         return networkModule.getAuxServerTransportList();
     }
 
+    /**
+     * Base factory for creating DiscoveryNode instances during node initialization.
+     */
     private static class LocalNodeFactory implements Function<BoundTransportAddress, DiscoveryNode> {
         private final SetOnce<DiscoveryNode> localNode = new SetOnce<>();
         private final String persistentNodeId;
-        private final Settings settings;
-        private final RemoteStoreNodeService remoteStoreNodeService;
+        protected final Settings settings;
 
-        private LocalNodeFactory(Settings settings, String persistentNodeId, RemoteStoreNodeService remoteStoreNodeService) {
+        private LocalNodeFactory(Settings settings, String persistentNodeId) {
             this.persistentNodeId = persistentNodeId;
             this.settings = settings;
-            this.remoteStoreNodeService = remoteStoreNodeService;
         }
 
         @Override
@@ -2332,11 +2332,6 @@ public class Node implements Closeable {
                 boundTransportAddress.publishAddress(),
                 persistentNodeId
             );
-
-            if (isRemoteStoreAttributePresent(settings)) {
-                remoteStoreNodeService.createAndVerifyRepositories(discoveryNode);
-            }
-
             localNode.set(discoveryNode);
             return localNode.get();
         }
@@ -2344,6 +2339,34 @@ public class Node implements Closeable {
         DiscoveryNode getNode() {
             assert localNode.get() != null;
             return localNode.get();
+        }
+    }
+
+    /**
+     * Extended factory that verifies remote store repositories during node creation.
+     */
+    private static class RemoteStoreVerifyingLocalNodeFactory extends LocalNodeFactory {
+
+        private final RemoteStoreNodeService remoteStoreNodeService;
+
+        private RemoteStoreVerifyingLocalNodeFactory(
+            Settings settings,
+            String persistentNodeId,
+            RemoteStoreNodeService remoteStoreNodeService
+        ) {
+            super(settings, persistentNodeId);
+            this.remoteStoreNodeService = remoteStoreNodeService;
+        }
+
+        @Override
+        public DiscoveryNode apply(BoundTransportAddress boundTransportAddress) {
+            final DiscoveryNode discoveryNode = super.apply(boundTransportAddress);
+
+            if (isRemoteStoreAttributePresent(settings)) {
+                remoteStoreNodeService.createAndVerifyRepositories(discoveryNode);
+            }
+
+            return discoveryNode;
         }
     }
 

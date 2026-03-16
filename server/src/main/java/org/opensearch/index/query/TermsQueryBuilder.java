@@ -32,6 +32,7 @@
 
 package org.opensearch.index.query;
 
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
@@ -303,8 +304,8 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> i
      */
     private static List<?> convert(Iterable<?> values) {
         List<?> list;
-        if (values instanceof List<?>) {
-            list = (List<?>) values;
+        if (values instanceof List<?> valuesList) {
+            list = valuesList;
         } else {
             ArrayList<Object> arrayList = new ArrayList<>();
             for (Object o : values) {
@@ -353,10 +354,10 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> i
                 int i = 0;
                 for (Object o : list) {
                     BytesRef b;
-                    if (o instanceof BytesRef) {
-                        b = (BytesRef) o;
-                    } else if (o instanceof CharBuffer) {
-                        b = new BytesRef((CharBuffer) o);
+                    if (o instanceof BytesRef bytesRef) {
+                        b = bytesRef;
+                    } else if (o instanceof CharBuffer charBuffer) {
+                        b = new BytesRef(charBuffer);
                     } else {
                         builder.copyChars(o.toString());
                         b = builder.get();
@@ -386,7 +387,7 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> i
             }
         }
 
-        return list.stream().map(o -> o instanceof String ? new BytesRef(o.toString()) : o).collect(Collectors.toList());
+        return list.stream().map(o -> o instanceof String str ? new BytesRef(str) : o).collect(Collectors.toList());
     }
 
     /**
@@ -405,8 +406,8 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> i
             @Override
             public Object get(int index) {
                 Object o = list.get(index);
-                if (o instanceof BytesRef) {
-                    o = ((BytesRef) o).utf8ToString();
+                if (o instanceof BytesRef bytesRef) {
+                    o = bytesRef.utf8ToString();
                 }
                 // we do not convert longs, all integer types are equivalent
                 // as far as this query is concerned
@@ -506,8 +507,8 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> i
 
         ValueType valueType = ValueType.fromString(valueTypeStr);
         if (valueType == ValueType.BITMAP) {
-            if (values != null && values.size() == 1 && values.get(0) instanceof BytesRef) {
-                values.set(0, new BytesArray(Base64.getDecoder().decode(((BytesRef) values.get(0)).utf8ToString())));
+            if (values != null && values.size() == 1 && values.get(0) instanceof BytesRef bytesRef) {
+                values.set(0, new BytesArray(Base64.getDecoder().decode(bytesRef.utf8ToString())));
             } else if (termsLookup == null) {
                 throw new IllegalArgumentException(
                     "Invalid value for bitmap type: Expected a single-element array with a base64 encoded serialized bitmap."
@@ -560,12 +561,11 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> i
             throw new IllegalStateException("Rewrite first");
         }
 
-        if (valueType == ValueType.BITMAP) {
-            if (values.size() == 1 && values.get(0) instanceof BytesArray) {
-                if (fieldType.unwrap() instanceof NumberFieldMapper.NumberFieldType) {
-                    return ((NumberFieldMapper.NumberFieldType) fieldType).bitmapQuery((BytesArray) values.get(0));
-                }
-            }
+        if (valueType == ValueType.BITMAP
+            && values.size() == 1
+            && values.get(0) instanceof BytesArray bytesArray
+            && fieldType.unwrap() instanceof NumberFieldMapper.NumberFieldType numberFieldType) {
+            return numberFieldType.bitmapQuery(bytesArray);
         }
         return fieldType.termsQuery(values, context);
     }
@@ -609,7 +609,9 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> i
                         // Get max_terms_count, max_result_window, and max_clause_count, fallback to their defaults
                         int maxTermsCount = IndexSettings.MAX_TERMS_COUNT_SETTING.get(idxSettings);
                         int maxResultWindow = IndexSettings.MAX_RESULT_WINDOW_SETTING.get(idxSettings);
-                        int maxClauseCount = idxSettings.getAsInt("indices.query.max_clause_count", 1024);
+                        // Reads the cluster-level max_clause_count, propagated via SearchService's
+                        // dynamic setting update consumer to IndexSearcher's static field.
+                        int maxClauseCount = IndexSearcher.getMaxClauseCount();
                         // The effective size must not exceed any of these
                         int fetchSize = Math.min(Math.min(maxTermsCount, maxResultWindow), maxClauseCount);
 

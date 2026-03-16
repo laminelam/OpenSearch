@@ -8,12 +8,17 @@
 
 package org.opensearch.search.aggregations.bucket.terms;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.IntroSelector;
 import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.lease.Releasables;
+import org.opensearch.common.util.IntArray;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -41,17 +46,24 @@ import static org.opensearch.search.aggregations.InternalOrder.isKeyOrder;
  * Stream search terms aggregation
  */
 public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
+    private static final Logger logger = LogManager.getLogger(StreamStringTermsAggregator.class);
     private SortedSetDocValues sortedDocValuesPerBatch;
     private long valueCount;
     private final ValuesSource.Bytes.WithOrdinals valuesSource;
     protected int segmentsWithSingleValuedOrds = 0;
     protected int segmentsWithMultiValuedOrds = 0;
-    protected final ResultStrategy<?, ?, ?> resultStrategy;
+    protected final ResultStrategy<?, ?> resultStrategy;
+    private boolean leafCollectorCreated = false;
+    private final int segmentTopN;
+
+    private Aggregator.BucketComparator ordinalComparator;
+    private StringTerms.Bucket tempBucket1;
+    private StringTerms.Bucket tempBucket2;
 
     public StreamStringTermsAggregator(
         String name,
         AggregatorFactories factories,
-        Function<StreamStringTermsAggregator, ResultStrategy<?, ?, ?>> resultStrategy,
+        Function<StreamStringTermsAggregator, ResultStrategy<?, ?>> resultStrategy,
         ValuesSource.Bytes.WithOrdinals valuesSource,
         BucketOrder order,
         DocValueFormat format,
@@ -60,11 +72,13 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
         Aggregator parent,
         SubAggCollectionMode collectionMode,
         boolean showTermDocCountError,
+        int segmentTopN,
         Map<String, Object> metadata
     ) throws IOException {
         super(name, factories, context, parent, order, format, bucketCountThresholds, collectionMode, showTermDocCountError, metadata);
         this.valuesSource = valuesSource;
         this.resultStrategy = resultStrategy.apply(this);
+        this.segmentTopN = segmentTopN;
     }
 
     @Override
@@ -72,11 +86,44 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
         super.doReset();
         valueCount = 0;
         sortedDocValuesPerBatch = null;
+        this.leafCollectorCreated = false;
+        this.ordinalComparator = null;
+        this.tempBucket1 = null;
+        this.tempBucket2 = null;
     }
 
-    @Override
-    protected boolean tryPrecomputeAggregationForLeaf(LeafReaderContext ctx) throws IOException {
-        return false;
+    private void ensureOrdinalComparator() {
+        if (ordinalComparator == null) {
+            if (isKeyOrder(order)) {
+                // For key-based ordering, compare ordinals directly (alphabetical order)
+                // Reverse comparison for descending order
+                boolean ascending = InternalOrder.isKeyAsc(order);
+                ordinalComparator = (leftOrd, rightOrd) -> {
+                    return ascending ? Long.compare(leftOrd, rightOrd) : Long.compare(rightOrd, leftOrd);
+                };
+            } else if (partiallyBuiltBucketComparator != null) {
+                // For sub-aggregation ordering, use bucket comparator
+                tempBucket1 = new StringTerms.Bucket(null, 0, null, false, 0, format) {
+                    @Override
+                    public int compareKey(StringTerms.Bucket other) {
+                        return Long.compare(this.bucketOrd, other.bucketOrd);
+                    }
+                };
+                tempBucket2 = new StringTerms.Bucket(null, 0, null, false, 0, format) {
+                    @Override
+                    public int compareKey(StringTerms.Bucket other) {
+                        return Long.compare(this.bucketOrd, other.bucketOrd);
+                    }
+                };
+                ordinalComparator = (leftOrd, rightOrd) -> {
+                    tempBucket1.bucketOrd = leftOrd;
+                    tempBucket1.docCount = bucketDocCount(leftOrd);
+                    tempBucket2.bucketOrd = rightOrd;
+                    tempBucket2.docCount = bucketDocCount(rightOrd);
+                    return partiallyBuiltBucketComparator.compare(tempBucket1, tempBucket2);
+                };
+            }
+        }
     }
 
     @Override
@@ -91,9 +138,15 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
 
     @Override
     public LeafBucketCollector getLeafCollector(LeafReaderContext ctx, LeafBucketCollector sub) throws IOException {
+        if (this.leafCollectorCreated) {
+            throw new IllegalStateException(
+                "Calling " + StreamStringTermsAggregator.class.getSimpleName() + " for the second segment: " + ctx
+            );
+        } else {
+            this.leafCollectorCreated = true;
+        }
         this.sortedDocValuesPerBatch = valuesSource.ordinalsValues(ctx);
-        this.valueCount = sortedDocValuesPerBatch.getValueCount(); // for streaming case, the value count is reset to per batch
-        // cardinality
+        this.valueCount = sortedDocValuesPerBatch.getValueCount();
         if (docCounts == null) {
             this.docCounts = context.bigArrays().newLongArray(valueCount, true);
         } else {
@@ -143,15 +196,25 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
     /**
      * Strategy for building results.
      */
-    abstract class ResultStrategy<
-        R extends InternalAggregation,
-        B extends InternalMultiBucketAggregation.InternalBucket,
-        TB extends InternalMultiBucketAggregation.InternalBucket> implements Releasable {
+    public abstract class ResultStrategy<R extends InternalAggregation, B extends InternalMultiBucketAggregation.InternalBucket>
+        implements
+            Releasable {
 
-        // build aggregation batch for stream search
+        protected IntArray reusableIndices;
+
+        protected ResultStrategy() {}
+
+        void prepareIndicesArray(long valueCount) {
+            if (reusableIndices == null) {
+                reusableIndices = context.bigArrays().newIntArray(valueCount, false);
+            } else {
+                reusableIndices = context.bigArrays().grow(reusableIndices, valueCount);
+            }
+        }
+
         InternalAggregation[] buildAggregationsBatch(long[] owningBucketOrds) throws IOException {
             LocalBucketCountThresholds localBucketCountThresholds = context.asLocalBucketCountThresholds(bucketCountThresholds);
-            if (valueCount == 0) { // no context in this reader
+            if (valueCount == 0) {
                 InternalAggregation[] results = new InternalAggregation[owningBucketOrds.length];
                 for (int ordIdx = 0; ordIdx < owningBucketOrds.length; ordIdx++) {
                     results[ordIdx] = buildNoValuesResult(owningBucketOrds[ordIdx]);
@@ -162,28 +225,21 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
             // for each owning bucket, there will be list of bucket ord of this aggregation
             B[][] topBucketsPerOwningOrd = buildTopBucketsPerOrd(owningBucketOrds.length);
             long[] otherDocCount = new long[owningBucketOrds.length];
+
             for (int ordIdx = 0; ordIdx < owningBucketOrds.length; ordIdx++) {
 
                 // processing each owning bucket
                 checkCancelled();
-                List<B> bucketsPerOwningOrd = new ArrayList<>();
-                for (long ordinal = 0; ordinal < valueCount; ordinal++) {
-                    long docCount = bucketDocCount(ordinal);
-                    if (bucketCountThresholds.getMinDocCount() == 0 || docCount > 0) {
-                        if (docCount >= localBucketCountThresholds.getMinDocCount()) {
-                            B finalBucket = buildFinalBucket(ordinal, docCount);
-                            bucketsPerOwningOrd.add(finalBucket);
-                        }
-                    }
-                }
+                logger.debug("Cardinality post collection for ordIdx {}: {}", ordIdx, valueCount);
+                // using bucketCountThresholds since we don't do reduce across slice
+                // and send results per segment to coordinator
+                SelectionResult<B> selectionResult = selectTopBuckets(segmentTopN, bucketCountThresholds);
 
-                // Get the top buckets
-                // ordered contains the top buckets for the owning bucket
-                topBucketsPerOwningOrd[ordIdx] = buildBuckets(bucketsPerOwningOrd.size());
-
+                topBucketsPerOwningOrd[ordIdx] = buildBuckets(selectionResult.buckets.size());
                 for (int i = 0; i < topBucketsPerOwningOrd[ordIdx].length; i++) {
-                    topBucketsPerOwningOrd[ordIdx][i] = bucketsPerOwningOrd.get(i);
+                    topBucketsPerOwningOrd[ordIdx][i] = selectionResult.buckets.get(i);
                 }
+                otherDocCount[ordIdx] = selectionResult.otherDocCount;
             }
 
             buildSubAggs(topBucketsPerOwningOrd);
@@ -195,10 +251,103 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
             return results;
         }
 
-        /**
-         * Short description of the collection mechanism added to the profile
-         * output to help with debugging.
-         */
+        private static class SelectionResult<B> {
+            final List<B> buckets;
+            final long otherDocCount;
+
+            SelectionResult(List<B> buckets, long otherDocCount) {
+                this.buckets = buckets;
+                this.otherDocCount = otherDocCount;
+            }
+        }
+
+        private SelectionResult<B> selectTopBuckets(int segmentSize, BucketCountThresholds thresholds) throws IOException {
+            prepareIndicesArray(valueCount);
+
+            int cnt = 0;
+            long totalDocCount = 0;
+            for (int i = 0; i < valueCount; i++) {
+                long docCount = bucketDocCount(i);
+                totalDocCount += docCount;
+                if (docCount >= thresholds.getMinDocCount()) {
+                    reusableIndices.set(cnt++, i);
+                }
+            }
+
+            segmentSize = Math.min(segmentSize, cnt);
+
+            if (cnt <= segmentSize) {
+                List<B> result = new ArrayList<>();
+                long selectedDocCount = 0;
+                for (int i = 0; i < cnt; i++) {
+                    long docCount = bucketDocCount(reusableIndices.get(i));
+                    result.add(buildFinalBucket(reusableIndices.get(i), docCount));
+                    selectedDocCount += docCount;
+                }
+                return new SelectionResult<>(result, totalDocCount - selectedDocCount);
+            }
+
+            IntroSelector selector = new IntroSelector() {
+                int pivotOrdinal;
+
+                @Override
+                protected void swap(int i, int j) {
+                    int temp = reusableIndices.get(i);
+                    reusableIndices.set(i, reusableIndices.get(j));
+                    reusableIndices.set(j, temp);
+                }
+
+                @Override
+                protected void setPivot(int i) {
+                    pivotOrdinal = reusableIndices.get(i);
+                }
+
+                @Override
+                protected int comparePivot(int j) {
+                    long leftOrd = reusableIndices.get(j);
+                    long rightOrd = pivotOrdinal;
+                    if (ordinalComparator != null) {
+                        return -ordinalComparator.compare(leftOrd, rightOrd);
+                    }
+                    // Fallback to doc count for _count ordering
+                    long leftDocCount = bucketDocCount(leftOrd);
+                    long rightDocCount = bucketDocCount(rightOrd);
+                    return Long.compare(leftDocCount, rightDocCount);
+                }
+            };
+
+            ensureOrdinalComparator();
+            selector.select(0, cnt, segmentSize);
+
+            int[] selected = new int[segmentSize];
+            for (int i = 0; i < segmentSize; i++) {
+                selected[i] = reusableIndices.get(i);
+            }
+
+            reusableIndices.fill(0, valueCount, 0);
+            for (int i = 0; i < segmentSize; i++) {
+                reusableIndices.set(selected[i], 1);
+            }
+
+            List<B> result = new ArrayList<>(segmentSize);
+            long selectedDocCount = 0;
+            for (int ordinal = 0; ordinal < valueCount; ordinal++) {
+                if (reusableIndices.get(ordinal) == 1) {
+                    long docCount = bucketDocCount(ordinal);
+                    result.add(buildFinalBucket(ordinal, docCount));
+                    selectedDocCount += docCount;
+                }
+            }
+
+            return new SelectionResult<>(result, totalDocCount - selectedDocCount);
+        }
+
+        @Override
+        public void close() {
+            Releasables.close(reusableIndices);
+            reusableIndices = null;
+        }
+
         abstract String describe();
 
         /**
@@ -247,7 +396,12 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
         abstract B buildFinalBucket(long ordinal, long docCount) throws IOException;
     }
 
-    class StandardTermsResults extends ResultStrategy<StringTerms, StringTerms.Bucket, GlobalOrdinalsStringTermsAggregator.OrdBucket> {
+    /**
+     * StandardTermsResults for string terms
+     *
+     * @opensearch.internal
+     */
+    public class StandardTermsResults extends ResultStrategy<StringTerms, StringTerms.Bucket> {
         @Override
         String describe() {
             return "streaming_terms";
@@ -314,12 +468,9 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
 
             StringTerms.Bucket result = new StringTerms.Bucket(term, docCount, null, showTermDocCountError, 0, format);
             result.bucketOrd = ordinal;
-            result.docCountError = 0;
+            result.setDocCountError(0);
             return result;
         }
-
-        @Override
-        public void close() {}
     }
 
     @Override
@@ -328,5 +479,10 @@ public class StreamStringTermsAggregator extends AbstractStringTermsAggregator {
         add.accept("result_strategy", resultStrategy.describe());
         add.accept("segments_with_single_valued_ords", segmentsWithSingleValuedOrds);
         add.accept("segments_with_multi_valued_ords", segmentsWithMultiValuedOrds);
+    }
+
+    @Override
+    public void doClose() {
+        Releasables.close(resultStrategy);
     }
 }
